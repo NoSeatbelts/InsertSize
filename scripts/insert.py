@@ -1,10 +1,10 @@
 import array
 import operator
 import sys
-from subprocess import check_output
 
 import pysam
 import numpy as np
+from itertools import chain
 try:
     from cytoolz import frequencies as freq
 except ImportError:
@@ -12,6 +12,124 @@ except ImportError:
         from stl.util import freq
     except ImportError:
         from collections import Counter as freq
+
+
+def get_pileup_pv(pileup_read):
+    if pileup_read.alignment.is_reverse:
+        return pileup_read.alignment.opt("PV")[
+            pileup_read.alignment.qlen - pileup_read.query_position - 1]
+    else:
+        return pileup_read.alignment.opt("PV")[pileup_read.query_position]
+
+
+def get_bc_stack(pileup):
+    from collections import defaultdict
+    ret = defaultdict(list)
+    for i in pileup.pileups:
+        bc = i.alignment.seq[i.query_position]
+        ret[bc].append(i)
+    return ret
+
+
+def get_expectation_count(bc_stacks, basecall='T', minFM=2):
+    """
+    bc_stack is a dict with base calls as keys
+    and lists of of pileup reads with the same base call.
+    """
+    pos_exp = sum(1 - 10**(-.1 * get_pileup_pv(pileup_read)) for
+                  pileup_read in bc_stacks[basecall])
+    # Expected number of false positives given observed other bases
+    neg_exp = sum(10**(-.1 * get_pileup_pv(pileup_read)) / 3 for
+                  pileup_read in chain.from_iterable(stack for key, stack in
+                                                     bc_stacks.items()
+                                                     if key != basecall))
+    '''
+    # Expected number given p values of other base calls
+    Could use this, but unsure if it's valid or safe.
+    '''
+    print "pos_exp", pos_exp, "neg_exp", neg_exp
+    if(sum(1 for pileup_read in bc_stacks[basecall] if
+           pileup_read.alignment.opt("FM") >= minFM) == 0):
+        print "No sufficient FM support. Abort!"
+        return 0  # Filter this out
+    skepticals = sum(1 for pileup_read in bc_stacks[basecall] if
+                     pileup_read.alignment.opt("FM") < minFM)
+    if neg_exp >= skepticals:
+        return int(pos_exp - neg_exp + 0.5)
+    else:
+        return int(pos_exp - skepticals + 0.5)
+
+
+class AAFObj(object):
+    def __init__(self, varcount, allcount):
+        self.frac = varcount * 1. / allcount
+        self.varcount = varcount
+        self.allcount = allcount
+
+    def __str__(self):
+        return "frac:%f,var:%i,all%i" % (self.frac, self.varcount,
+                                         self.allcount)
+
+
+class AAFStats(object):
+    def __init__(self, pileup_column, minFM=2, ref='C', alt='T'):
+        all_counts = freq(i.alignment.seq[i.query_position] for
+                          i in pileup_column.pileups)
+        fm_counts = freq(i.alignment.seq[i.query_position] for
+                         i in pileup_column.pileups
+                         if i.alignment.opt("FM") >= minFM)
+        if alt not in all_counts:
+            all_counts[alt] = 0
+        if alt not in fm_counts:
+            fm_counts[alt] = 0
+        self.all = AAFObj(all_counts[alt], sum(all_counts.values()))
+        self.fm = AAFObj(fm_counts[alt], sum(fm_counts.values()))
+        self.all_discounted = AAFObj(fm_counts[alt], sum(all_counts.values()))
+        bc_stacks = get_bc_stack(pileup_column)
+        self.all_expected = AAFObj(get_expectation_count(bc_stacks, alt,
+                                                         minFM),
+                                   sum(all_counts.values()))
+
+    def __str__(self):
+        return "%s\t%s\t%s\t%s\t" % (self.all, self.fm, self.all_discounted,
+                                     self.all_expected)
+
+
+def print_aaf_rates(outfile, bamlist, contig, pos, ref='C', alt='T', minFM=2):
+    fh = open(outfile, "w")
+    fh.write("Bam name\tAll[aaf/aac/all_allele count]\t"
+             "FM>=%i[aaf/aac/all_allele_count]\t"
+             "DiscountSingles[aaf/aac/all_allele count]\t"
+             "ExpectationCount[aaf/aac/all_allele count]\n" % minFM)
+    for bam in bamlist:
+        a = pysam.AlignmentFile(bam)
+        b = a.pileup(contig, pos)
+        c = b.next()
+        while c.pos < pos:
+            c = b.next()
+        fh.write(bam + "\t")
+        fh.write(str(AAFStats(c, minFM=minFM, ref=ref, alt=alt)))
+        fh.write("\n")
+    fh.close()
+
+
+def aaf_ret(bam, contig, pos, ref='C', alt='T', minFM=1):
+    """
+    Returns the frequency of ref allele 'C' in pileup in a bam.
+    """
+    a = pysam.AlignmentFile(bam)
+    b = a.pileup(contig, pos)
+    c = b.next()
+    while c.pos < pos:
+        c = b.next()
+    counts = freq(i.alignment.seq[i.query_position] for i in c.pileups
+                  if i.alignment.opt("FM") >= minFM)
+    try:
+        return counts[alt] / counts[ref]
+    except KeyError:
+        if ref not in counts:
+            return -137.
+        return 0.
 
 
 def aaf_pos(bam, contig, pos, ref='C', alt='T', minFM=1):
@@ -216,47 +334,37 @@ def mean_insert_dict(files, minFM=2, max_insert=250):
     return {fn: get_mean_insert(fn, minFM, max_insert) for fn in files}
 
 
-def get_gene_depths(bampath, bedpath, minMQ=0):
-    gene_footprints = {}
-    for line in open(bedpath, "r"):
-        if len(line) < 20:
-            continue
-        contig, start, stop, name = line.strip().split('\t')
-        try:
-            gene_footprints[name.split("_")[0]] += int(stop) - int(start)
-        except KeyError:
-            gene_footprints[name.split("_")[0]] = int(stop) - int(start)
-    gene_depths = {}
-    bedcov = check_output("samtools bedcov -Q%i %s %s" % \
-                          (minMQ, bedpath, bampath),
-                          shell=True)
-    for line in bedcov.split('\n'):
-        if len(line) < 1:
-            continue
-        print line
-        toks = line.strip().split('\t')
-        contig, start, stop, name, counts = toks[:5]
-        try:
-            gene_depths[name.split("_")[0]] += int(counts)
-        except KeyError:
-            gene_depths[name.split("_")[0]] = int(counts)
-    ret = {}
-    for key in gene_footprints.iterkeys():
-        ret[key] = gene_depths[key] * 1. / gene_footprints[key]
-    return {key: value * 1. / gene_footprints[key] for
-            key, value in gene_depths.iteritems()}
+def parse_samtools_insert_stats(path):
+    import collections
+    ret = collections.defaultdict(lambda: 0)
+    for line in open(path):
+        toks = line.split('\t')
+        ret[int(toks[0])] = int(toks[1])
+    return ret
 
 
-def write_gene_depths(bampath, bedpath):
-    with open(bampath + ".depth_by_gene.txt", "w") as f:
-        f.write("#Filename\tminMQ0\tminMQ1\n")
-        minMQ0 = get_gene_depths(bampath, bedpath, 0)
-        minMQ1 = get_gene_depths(bampath, bedpath, 1)
-        f.write("\n".join("%s\t%s\t%s\t" % (key, value, minMQ1[key]) for
-                          key, value in minMQ0.iteritems()))
+def build_samtools_insert_dict(fns):
+    return {fn.split('/')[-1].split('.')[0]:
+            parse_samtools_insert_stats(fn)
+            for fn in fns}
 
-def batch_gene_depths(bedpath, l=[]):
-    if len(l) == 0:
-        l = check_output("ls *.rsq.bam", shell=True).split('\n')
-    for fn in l:
-        write_gene_depths(fn, bedpath)
+
+def write_samtools_insert_table(fns, outfile):
+    ofh = open(outfile, "w")
+    insert_data = build_samtools_insert_dict(fns)
+    # Make the union of the insert size counts
+    key_union = set()
+    for d in insert_data.values():
+        key_union |= set(d.keys())
+    sorted_keys = sorted(key_union)
+    del key_union
+    ofh.write("#Insert Size")
+    sorted_prefixes = sorted(insert_data.keys())
+    for prefix in sorted_prefixes:
+        ofh.write("\t%s" % prefix)
+    ofh.write("\n")
+    for key in sorted_keys:
+        ofh.write("%i" % key)
+        for prefix in sorted_prefixes:
+            ofh.write("\t%i" % insert_data[prefix][key])
+        ofh.write("\n")
