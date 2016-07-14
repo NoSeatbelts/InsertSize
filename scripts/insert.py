@@ -5,6 +5,7 @@ import sys
 import pysam
 import numpy as np
 from itertools import chain
+from collections import defaultdict
 try:
     from cytoolz import frequencies as freq
 except ImportError:
@@ -23,11 +24,8 @@ def get_pileup_pv(pileup_read):
 
 
 def get_bc_stack(pileup):
-    from collections import defaultdict
     ret = defaultdict(list)
-    for i in pileup.pileups:
-        bc = i.alignment.seq[i.query_position]
-        ret[bc].append(i)
+    [ret[i.alignment.seq[i.query_position]].append(i) for i in pileup.pileups]
     return ret
 
 
